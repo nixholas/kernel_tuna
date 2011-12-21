@@ -23,6 +23,15 @@ config ASHMEM
 
 config ANDROID_LOGGER
 	tristate "Android log driver"
+	default n
+	depends on SHMEM || TINY_SHMEM
+	help
+	  The ashmem subsystem is a new shared memory allocator, similar to
+	  POSIX SHM but with different behavior and sporting a simpler
+	  file-based API.
+
+config ANDROID_LOGGER
+	tristate "Android log driver"
 
 config LOGCAT_SIZE
 	int "Adjust android log buffer sizes (KB) "
