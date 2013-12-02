@@ -1,5 +1,5 @@
 /*
- * CPUFreq amplug governor
+ * CPUFreq hotplug governor
  *
  * Copyright (C) 2010 Texas Instruments, Inc.
  *   Mike Turquette <mturquette@ti.com>
@@ -9,9 +9,6 @@
  * Copyright (C)  2001 Russell King
  *           (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>,
  *                     Jun Nakajima <jun.nakajima@intel.com>
- *
- * AMPlug Governor
- * Modified by the A.S.K.P Dev Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -27,17 +24,34 @@
 #include <linux/kernel_stat.h>
 #include <linux/mutex.h>
 #include <linux/hrtimer.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/tick.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
+#include <linux/err.h>
 #include <linux/slab.h>
+#include <linux/kthread.h>
+#include <asm/cputime.h>
 
-#define DEFAULT_UP_FREQ_MIN_LOAD			(85)
-#define DEFAULT_FREQ_DOWN_DIFFERENTIAL			(7)
-#define DEFAULT_DOWN_FREQ_MAX_LOAD			(40)
+
+/* greater than 80% avg load across online CPUs increases frequency */
+#define DEFAULT_UP_FREQ_MIN_LOAD			(80)
+
+/* Keep 10% of idle under the up threshold when decreasing the frequency */
+#define DEFAULT_FREQ_DOWN_DIFFERENTIAL			(10)
+
+/* less than 30% avg load across online CPUs decreases frequency */
+#define DEFAULT_DOWN_FREQ_MAX_LOAD			(30)
+
+/* default sampling period (uSec) is bogus; 10x ondemand's default for x86 */
 #define DEFAULT_SAMPLING_PERIOD				(100000)
-#define DEFAULT_AMPLUG_IN_SAMPLING_PERIODS		(5)
-#define DEFAULT_AMPLUG_OUT_SAMPLING_PERIODS		(20)
+
+/* default number of sampling periods to average before hotplug-in decision */
+#define DEFAULT_HOTPLUG_IN_SAMPLING_PERIODS		(3)
+
+/* default number of sampling periods to average before hotplug-out decision */
+#define DEFAULT_HOTPLUG_OUT_SAMPLING_PERIODS		(15)
 
 static void do_dbs_timer(struct work_struct *work);
 static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
@@ -77,17 +91,17 @@ static unsigned int dbs_enable;	/* number of CPUs using this policy */
  */
 static DEFINE_MUTEX(dbs_mutex);
 
-static struct workqueue_struct	*kamplug_wq;
+static struct workqueue_struct	*khotplug_wq;
 
 static struct dbs_tuners {
 	unsigned int sampling_rate;
 	unsigned int up_threshold;
 	unsigned int down_differential;
 	unsigned int down_threshold;
-	unsigned int amplug_in_sampling_periods;
-	unsigned int amplug_out_sampling_periods;
-	unsigned int amplug_load_index;
-	unsigned int *amplug_load_history;
+	unsigned int hotplug_in_sampling_periods;
+	unsigned int hotplug_out_sampling_periods;
+	unsigned int hotplug_load_index;
+	unsigned int *hotplug_load_history;
 	unsigned int ignore_nice;
 	unsigned int io_is_busy;
 } dbs_tuners_ins = {
@@ -95,9 +109,9 @@ static struct dbs_tuners {
 	.up_threshold =			DEFAULT_UP_FREQ_MIN_LOAD,
 	.down_differential =            DEFAULT_FREQ_DOWN_DIFFERENTIAL,
 	.down_threshold =		DEFAULT_DOWN_FREQ_MAX_LOAD,
-	.amplug_in_sampling_periods =	DEFAULT_AMPLUG_IN_SAMPLING_PERIODS,
-	.amplug_out_sampling_periods =	DEFAULT_AMPLUG_OUT_SAMPLING_PERIODS,
-	.amplug_load_index =		0,
+	.hotplug_in_sampling_periods =	DEFAULT_HOTPLUG_IN_SAMPLING_PERIODS,
+	.hotplug_out_sampling_periods =	DEFAULT_HOTPLUG_OUT_SAMPLING_PERIODS,
+	.hotplug_load_index =		0,
 	.ignore_nice =			0,
 	.io_is_busy =			0,
 };
@@ -114,13 +128,13 @@ static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
         u64 idle_time;
         u64 iowait_time;
 
-        /* cpufreq-amplug always assumes CONFIG_NO_HZ */
+        /* cpufreq-hotplug always assumes CONFIG_NO_HZ */
         idle_time = get_cpu_idle_time_us(cpu, wall);
 
 	/* add time spent doing I/O to idle time */
         if (dbs_tuners_ins.io_is_busy) {
                 iowait_time = get_cpu_iowait_time_us(cpu, wall);
-                /* cpufreq-amplug always assumes CONFIG_NO_HZ */
+                /* cpufreq-hotplug always assumes CONFIG_NO_HZ */
                 if (iowait_time != -1ULL && idle_time >= iowait_time)
                         idle_time -= iowait_time;
         }
@@ -132,7 +146,7 @@ static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
 
 /* XXX look at global sysfs macros in cpufreq.h, can those be used here? */
 
-/* cpufreq_amplug Governor Tunables */
+/* cpufreq_hotplug Governor Tunables */
 #define show_one(file_name, object)					\
 static ssize_t show_##file_name						\
 (struct kobject *kobj, struct attribute *attr, char *buf)		\
@@ -143,8 +157,8 @@ show_one(sampling_rate, sampling_rate);
 show_one(up_threshold, up_threshold);
 show_one(down_differential, down_differential);
 show_one(down_threshold, down_threshold);
-show_one(amplug_in_sampling_periods, amplug_in_sampling_periods);
-show_one(amplug_out_sampling_periods, amplug_out_sampling_periods);
+show_one(hotplug_in_sampling_periods, hotplug_in_sampling_periods);
+show_one(hotplug_out_sampling_periods, hotplug_out_sampling_periods);
 show_one(ignore_nice_load, ignore_nice);
 show_one(io_is_busy, io_is_busy);
 
@@ -230,17 +244,17 @@ static ssize_t store_hotplug_in_sampling_periods(struct kobject *a,
 		return -EINVAL;
 
 	/* already using this value, bail out */
-	if (input == dbs_tuners_ins.amplug_in_sampling_periods)
+	if (input == dbs_tuners_ins.hotplug_in_sampling_periods)
 		return count;
 
 	mutex_lock(&dbs_mutex);
 	ret = count;
-	max_windows = max(dbs_tuners_ins.amplug_in_sampling_periods,
-			dbs_tuners_ins.amplug_out_sampling_periods);
+	max_windows = max(dbs_tuners_ins.hotplug_in_sampling_periods,
+			dbs_tuners_ins.hotplug_out_sampling_periods);
 
 	/* no need to resize array */
 	if (input <= max_windows) {
-		dbs_tuners_ins.amplug_in_sampling_periods = input;
+		dbs_tuners_ins.hotplug_in_sampling_periods = input;
 		goto out;
 	}
 
@@ -252,21 +266,21 @@ static ssize_t store_hotplug_in_sampling_periods(struct kobject *a,
 		goto out;
 	}
 
-	memcpy(temp, dbs_tuners_ins.amplug_load_history,
+	memcpy(temp, dbs_tuners_ins.hotplug_load_history,
 			(max_windows * sizeof(unsigned int)));
-	kfree(dbs_tuners_ins.amplug_load_history);
+	kfree(dbs_tuners_ins.hotplug_load_history);
 
 	/* replace old buffer, old number of sampling periods & old index */
-	dbs_tuners_ins.amplug_load_history = temp;
-	dbs_tuners_ins.amplug_in_sampling_periods = input;
-	dbs_tuners_ins.amplug_load_index = max_windows;
+	dbs_tuners_ins.hotplug_load_history = temp;
+	dbs_tuners_ins.hotplug_in_sampling_periods = input;
+	dbs_tuners_ins.hotplug_load_index = max_windows;
 out:
 	mutex_unlock(&dbs_mutex);
 
 	return ret;
 }
 
-static ssize_t store_amplug_out_sampling_periods(struct kobject *a,
+static ssize_t store_hotplug_out_sampling_periods(struct kobject *a,
 		struct attribute *b, const char *buf, size_t count)
 {
 	unsigned int input;
@@ -279,17 +293,17 @@ static ssize_t store_amplug_out_sampling_periods(struct kobject *a,
 		return -EINVAL;
 
 	/* already using this value, bail out */
-	if (input == dbs_tuners_ins.amplug_out_sampling_periods)
+	if (input == dbs_tuners_ins.hotplug_out_sampling_periods)
 		return count;
 
 	mutex_lock(&dbs_mutex);
 	ret = count;
-	max_windows = max(dbs_tuners_ins.amplug_in_sampling_periods,
-			dbs_tuners_ins.amplug_out_sampling_periods);
+	max_windows = max(dbs_tuners_ins.hotplug_in_sampling_periods,
+			dbs_tuners_ins.hotplug_out_sampling_periods);
 
 	/* no need to resize array */
 	if (input <= max_windows) {
-		dbs_tuners_ins.amplug_out_sampling_periods = input;
+		dbs_tuners_ins.hotplug_out_sampling_periods = input;
 		goto out;
 	}
 
@@ -301,14 +315,14 @@ static ssize_t store_amplug_out_sampling_periods(struct kobject *a,
 		goto out;
 	}
 
-	memcpy(temp, dbs_tuners_ins.amplug_load_history,
+	memcpy(temp, dbs_tuners_ins.hotplug_load_history,
 			(max_windows * sizeof(unsigned int)));
-	kfree(dbs_tuners_ins.amplug_load_history);
+	kfree(dbs_tuners_ins.hotplug_load_history);
 
 	/* replace old buffer, old number of sampling periods & old index */
-	dbs_tuners_ins.amplug_load_history = temp;
-	dbs_tuners_ins.amplug_out_sampling_periods = input;
-	dbs_tuners_ins.amplug_load_index = max_windows;
+	dbs_tuners_ins.hotplug_load_history = temp;
+	dbs_tuners_ins.hotplug_out_sampling_periods = input;
+	dbs_tuners_ins.hotplug_load_index = max_windows;
 out:
 	mutex_unlock(&dbs_mutex);
 
@@ -373,8 +387,8 @@ define_one_global_rw(sampling_rate);
 define_one_global_rw(up_threshold);
 define_one_global_rw(down_differential);
 define_one_global_rw(down_threshold);
-define_one_global_rw(amplug_in_sampling_periods);
-define_one_global_rw(amplug_out_sampling_periods);
+define_one_global_rw(hotplug_in_sampling_periods);
+define_one_global_rw(hotplug_out_sampling_periods);
 define_one_global_rw(ignore_nice_load);
 define_one_global_rw(io_is_busy);
 
@@ -383,8 +397,8 @@ static struct attribute *dbs_attributes[] = {
 	&up_threshold.attr,
 	&down_differential.attr,
 	&down_threshold.attr,
-	&amplug_in_sampling_periods.attr,
-	&amplug_out_sampling_periods.attr,
+	&hotplug_in_sampling_periods.attr,
+	&hotplug_out_sampling_periods.attr,
 	&ignore_nice_load.attr,
 	&io_is_busy.attr,
 	NULL
@@ -392,7 +406,7 @@ static struct attribute *dbs_attributes[] = {
 
 static struct attribute_group dbs_attr_group = {
 	.attrs = dbs_attributes,
-	.name = "amplug",
+	.name = "hotplug",
 };
 
 /************************** sysfs end ************************/
@@ -407,10 +421,10 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 	unsigned int max_load_freq = 0;
 	/* average load across all enabled CPUs */
 	unsigned int avg_load = 0;
-	/* average load across multiple sampling periods for amplug events */
-	unsigned int amplug_in_avg_load = 0;
-	unsigned int amplug_out_avg_load = 0;
-	/* number of sampling periods averaged for amplug decisions */
+	/* average load across multiple sampling periods for hotplug events */
+	unsigned int hotplug_in_avg_load = 0;
+	unsigned int hotplug_out_avg_load = 0;
+	/* number of sampling periods averaged for hotplug decisions */
 	unsigned int periods;
 
 	struct cpufreq_policy *policy;
@@ -465,48 +479,48 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 
 
 	/*
-	 * amplug load accounting
+	 * hotplug load accounting
 	 * average load over multiple sampling periods
 	 */
 
-	/* how many sampling periods do we use for amplug decisions? */
-	periods = max(dbs_tuners_ins.amplug_in_sampling_periods,
-			dbs_tuners_ins.amplug_out_sampling_periods);
+	/* how many sampling periods do we use for hotplug decisions? */
+	periods = max(dbs_tuners_ins.hotplug_in_sampling_periods,
+			dbs_tuners_ins.hotplug_out_sampling_periods);
 
 	/* store avg_load in the circular buffer */
-	dbs_tuners_ins.amplug_load_history[dbs_tuners_ins.amplug_load_index]
+	dbs_tuners_ins.hotplug_load_history[dbs_tuners_ins.hotplug_load_index]
 		= avg_load;
 
 	/* compute average load across in & out sampling periods */
-	for (i = 0, j = dbs_tuners_ins.amplug_load_index;
+	for (i = 0, j = dbs_tuners_ins.hotplug_load_index;
 			i < periods; i++, j--) {
-		if (i < dbs_tuners_ins.amplug_in_sampling_periods)
-			amplug_in_avg_load +=
-				dbs_tuners_ins.amplug_load_history[j];
-		if (i < dbs_tuners_ins.amplug_out_sampling_periods)
-			amplug_out_avg_load +=
-				dbs_tuners_ins.amplug_load_history[j];
+		if (i < dbs_tuners_ins.hotplug_in_sampling_periods)
+			hotplug_in_avg_load +=
+				dbs_tuners_ins.hotplug_load_history[j];
+		if (i < dbs_tuners_ins.hotplug_out_sampling_periods)
+			hotplug_out_avg_load +=
+				dbs_tuners_ins.hotplug_load_history[j];
 
 		if (j == 0)
 			j = periods;
 	}
 
-	amplug_in_avg_load = amplug_in_avg_load /
-		dbs_tuners_ins.amplug_in_sampling_periods;
+	hotplug_in_avg_load = hotplug_in_avg_load /
+		dbs_tuners_ins.hotplug_in_sampling_periods;
 
-	amplug_out_avg_load = amplug_out_avg_load /
-		dbs_tuners_ins.amplug_out_sampling_periods;
+	hotplug_out_avg_load = hotplug_out_avg_load /
+		dbs_tuners_ins.hotplug_out_sampling_periods;
 
 	/* return to first element if we're at the circular buffer's end */
-	if (++dbs_tuners_ins.amplug_load_index == periods)
-		dbs_tuners_ins.amplug_load_index = 0;
+	if (++dbs_tuners_ins.hotplug_load_index == periods)
+		dbs_tuners_ins.hotplug_load_index = 0;
 
 	/* check if auxiliary CPU is needed based on avg_load */
 	if (avg_load > dbs_tuners_ins.up_threshold) {
 		/* should we enable auxillary CPUs? */
-		if (num_online_cpus() < 2 && amplug_in_avg_load >
+		if (num_online_cpus() < 2 && hotplug_in_avg_load >
 				dbs_tuners_ins.up_threshold) {
-			/* amplug with cpufreq is nasty
+			/* hotplug with cpufreq is nasty
 			 * a call to cpufreq_governor_dbs may cause a lockup.
 			 * wq is not running here so its safe.
 			 */
@@ -532,7 +546,7 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		/* are we at the minimum frequency already? */
 		if (policy->cur == policy->min) {
 			/* should we disable auxillary CPUs? */
-			if (num_online_cpus() > 1 && amplug_out_avg_load <
+			if (num_online_cpus() > 1 && hotplug_out_avg_load <
 					dbs_tuners_ins.down_threshold) {
 				mutex_unlock(&this_dbs_info->timer_mutex);
 				cpu_down(1);
@@ -575,7 +589,7 @@ static void do_dbs_timer(struct work_struct *work)
 
 	mutex_lock(&dbs_info->timer_mutex);
 	dbs_check_cpu(dbs_info);
-	queue_delayed_work_on(cpu, kamplug_wq, &dbs_info->work, delay);
+	queue_delayed_work_on(cpu, khotplug_wq, &dbs_info->work, delay);
 	mutex_unlock(&dbs_info->timer_mutex);
 }
 
@@ -586,7 +600,7 @@ static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
 	delay -= jiffies % delay;
 
 	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
-	queue_delayed_work_on(dbs_info->cpu, kamplug_wq, &dbs_info->work,
+	queue_delayed_work_on(dbs_info->cpu, khotplug_wq, &dbs_info->work,
 		delay);
 }
 
@@ -624,17 +638,17 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 						kstat_cpu(j).cpustat.nice;
 			}
 
-			max_periods = max(DEFAULT_AMPLUG_IN_SAMPLING_PERIODS,
-					DEFAULT_AMPLUG_OUT_SAMPLING_PERIODS);
-			dbs_tuners_ins.amplug_load_history = kmalloc(
+			max_periods = max(DEFAULT_HOTPLUG_IN_SAMPLING_PERIODS,
+					DEFAULT_HOTPLUG_OUT_SAMPLING_PERIODS);
+			dbs_tuners_ins.hotplug_load_history = kmalloc(
 					(sizeof(unsigned int) * max_periods),
 					GFP_KERNEL);
-			if (!dbs_tuners_ins.amplug_load_history) {
+			if (!dbs_tuners_ins.hotplug_load_history) {
 				WARN_ON(1);
 				return -ENOMEM;
 			}
 			for (i = 0; i < max_periods; i++)
-				dbs_tuners_ins.amplug_load_history[i] = 50;
+				dbs_tuners_ins.hotplug_load_history[i] = 50;
 		}
 		this_dbs_info->cpu = cpu;
 		this_dbs_info->freq_table = cpufreq_frequency_get_table(cpu);
@@ -666,7 +680,7 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		if (!dbs_enable)
 			sysfs_remove_group(cpufreq_global_kobject,
 					   &dbs_attr_group);
-		kfree(dbs_tuners_ins.amplug_load_history);
+		kfree(dbs_tuners_ins.hotplug_load_history);
 		/*
 		 * XXX BIG CAVEAT: Stopping the governor with CPU1 offline
 		 * will result in it remaining offline until the user onlines
@@ -700,31 +714,31 @@ static int __init cpufreq_gov_dbs_init(void)
 	if (idle_time != -1ULL) {
 		dbs_tuners_ins.up_threshold = DEFAULT_UP_FREQ_MIN_LOAD;
 	} else {
-		pr_err("cpufreq-amplug: %s: assumes CONFIG_NO_HZ\n",
+		pr_err("cpufreq-hotplug: %s: assumes CONFIG_NO_HZ\n",
 				__func__);
 		return -EINVAL;
 	}
 
-	kamplug_wq = create_workqueue("kamplug");
-	if (!kamplug_wq) {
-		pr_err("Creation of kamplug failed\n");
+	khotplug_wq = create_workqueue("khotplug");
+	if (!khotplug_wq) {
+		pr_err("Creation of khotplug failed\n");
 		return -EFAULT;
 	}
-	err = cpufreq_register_governor(&cpufreq_gov_amplug);
+	err = cpufreq_register_governor(&cpufreq_gov_hotplug);
 	if (err)
-		destroy_workqueue(kamplug_wq);
+		destroy_workqueue(khotplug_wq);
 
 	return err;
 }
 
 static void __exit cpufreq_gov_dbs_exit(void)
 {
-	cpufreq_unregister_governor(&cpufreq_gov_amplug);
-	destroy_workqueue(kamplug_wq);
+	cpufreq_unregister_governor(&cpufreq_gov_hotplug);
+	destroy_workqueue(khotplug_wq);
 }
 
-MODULE_AUTHOR("Nicholas <amperific@gmail.com>");
-MODULE_DESCRIPTION("'cpufreq_amplug' - cpufreq governor for dynamic frequency scaling and CPU amplugging based on amplug");
+MODULE_AUTHOR("Mike Turquette <mturquette@ti.com>");
+MODULE_DESCRIPTION("'cpufreq_hotplug' - cpufreq governor for dynamic frequency scaling and CPU hotplugging");
 MODULE_LICENSE("GPL");
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_AMPLUG
