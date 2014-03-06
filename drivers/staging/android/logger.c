@@ -29,6 +29,13 @@
 
 #include <asm/ioctls.h>
 
+#ifndef CONFIG_LOGCAT_SIZE
+#define CONFIG_LOGCAT_SIZE 256
+#endif
+
+static unsigned int log_enabled = 1;
+module_param(log_enabled, uint, S_IWUSR | S_IRUGO);
+
 /*
  * struct logger_log - represents a specific log, such as 'main' or 'radio'
  *
