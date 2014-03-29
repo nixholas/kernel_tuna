@@ -471,8 +471,6 @@ static bool tuna_otg_vbus_present(void)
 }
 */
 
-*/
-
 static void tuna_fsa_usb_detected(int device)
 {
 	struct tuna_otg *tuna_otg = &tuna_otg_xceiv;
