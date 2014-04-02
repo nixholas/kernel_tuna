@@ -49,14 +49,11 @@ int omap_ion_nonsecure_tiler_alloc(struct ion_client *client,
 /* given a handle in the tiler, return a list of tiler pages that back it */
 int omap_tiler_pages(struct ion_client *client, struct ion_handle *handle,
 		     int *n, u32 ** tiler_pages);
-<<<<<<< HEAD
-=======
 int omap_ion_share_fd_to_buffers(int fd, struct ion_buffer **buffers,
 				 int *num_handles);
 int omap_tiler_vinfo(struct ion_client *client,
 			struct ion_handle *handle, unsigned int *vstride,
 			unsigned int *vsize);
->>>>>>> 0419e8f... ion: omap: change behaviour of getting buffers from pvr fd
 #endif /* __KERNEL__ */
 
 /* additional heaps used only on omap */
@@ -93,4 +90,5 @@ enum {
 };
 
 #endif /* _LINUX_ION_H */
+
 
