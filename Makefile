@@ -369,17 +369,16 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
 		   -fno-delete-null-pointer-checks \
-		   -fsingle-precision-constant
+		   -fsingle-precision-constant -pipe
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
 
 ifdef CONFIG_CC_GRAPHITE_OPTIMIZATION
-KBUILD_CFLAGS      += -fgraphite-identity -floop-parallelize-all -floop-interchange -floop-strip-mine \
-                  -floop-block
+KBUILD_CFLAGS      += -fgraphite-identity -floop-parallelize-all -ftree-loop-linear -floop-interchange -floop-strip-mine -floop-block -ftree-loop-distribution -ftree-parallelize-loops=2
 endif
 
 ifdef CONFIG_CC_LINK_TIME_OPTIMIZATION
-KBUILD_CFLAGS        += -flto -fno-toplevel-reorder -fno-fat-lto-objects -ftlo=2
+KBUILD_CFLAGS        += -flto -fno-toplevel-reorder -flto-compression-level=7 -fuse-linker-plugin
 endif
 
 KBUILD_AFLAGS   := -D__ASSEMBLY__
